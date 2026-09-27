@@ -1,0 +1,32 @@
+[package]
+name = "plank-mail-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+authors = ["Enzo Lombardi <enzinol@gmail.com>"]
+description = "A read-mostly MCP server over one Outlook mailbox, for plank's HAL profile"
+license = "MIT"
+repository = "https://github.com/aovestdipaperino/plank-mail-mcp"
+homepage = "https://github.com/aovestdipaperino/plank-mail-mcp"
+readme = "README.md"
+keywords = ["mcp", "outlook", "email", "plank"]
+categories = ["command-line-utilities", "email"]
+
+[dependencies]
+anyhow = "1.0.104"
+html2text = "0.17.1"
+keyring = "4"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "form"] }
+rmcp = { version = "3.4", features = ["server", "transport-io", "macros"] }
+schemars = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["full"] }
+toml = "1.1.6"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+# Trait impls (the Mailbox mock, rmcp's generated handlers) must be async to
+# match their trait even when a body never awaits.
+unused_async_trait_impl = "allow"
