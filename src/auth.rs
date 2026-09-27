@@ -1,14 +1,22 @@
-//! Signing in to Microsoft: the device-code flow, token refresh, and the
-//! refresh token's home in the Keychain.
+//! Signing in to Microsoft in the browser, token refresh, and the refresh
+//! token's home in the Keychain.
 //!
 //! The scopes are the safety boundary. `Mail.ReadWrite` lets the server read,
 //! flag, draft and move; `Mail.Send` is never requested, so no token this
 //! program holds can send mail, whatever the code above it does.
+//!
+//! Sign-in is the authorization-code flow for installed apps: the browser
+//! opens Microsoft's page, Microsoft redirects back to a one-shot listener on
+//! `127.0.0.1`, and the code is exchanged for tokens. PKCE ties the exchange to
+//! this process, and the `state` value ties the redirect to this sign-in.
 
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use base64::Engine as _;
 use serde::Deserialize;
+use sha2::Digest as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::Mutex;
 
 /// The Microsoft identity platform, for work and personal accounts alike.
@@ -21,27 +29,8 @@ pub const SCOPES: &str = "https://graph.microsoft.com/Mail.ReadWrite https://gra
 /// The Keychain service the refresh token is stored under.
 const KEYCHAIN_SERVICE: &str = "plank-mail-mcp";
 
-/// The device-code endpoint's answer.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct DeviceAuthorization {
-    /// Sent back while polling.
-    pub device_code: String,
-    /// What the user types at the verification page.
-    pub user_code: String,
-    /// Where they type it.
-    pub verification_uri: String,
-    /// Seconds until the code expires.
-    pub expires_in: u64,
-    /// Seconds to wait between polls.
-    #[serde(default = "default_interval")]
-    pub interval: u64,
-    /// Microsoft's own one-line instruction for the user.
-    pub message: String,
-}
-
-fn default_interval() -> u64 {
-    5
-}
+/// How long the browser has to come back before `login` gives up.
+const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// A successful token response.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -54,92 +43,189 @@ pub struct Tokens {
     pub refresh_token: Option<String>,
 }
 
-/// What one poll of the token endpoint came to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Poll {
-    /// Signed in.
-    Done(Tokens),
-    /// The user has not approved yet; ask again after the interval.
-    Pending,
-    /// Asked too often; ask again after a longer interval.
-    SlowDown,
-    /// The flow ended without a sign-in.
-    Failed(String),
+/// `len` random bytes as URL-safe base64 without padding.
+fn random_token(len: usize) -> Result<String> {
+    let mut bytes = vec![0u8; len];
+    getrandom::fill(&mut bytes).map_err(|e| anyhow!("no randomness available: {e}"))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
-/// An OAuth error answer.
-#[derive(Deserialize)]
-struct OauthError {
-    error: String,
-    error_description: Option<String>,
-}
-
-/// Classifies a token-endpoint response body from the device-code poll.
+/// The PKCE `S256` challenge for `verifier`.
 #[must_use]
-pub fn classify_poll(body: &str) -> Poll {
-    if let Ok(tokens) = serde_json::from_str::<Tokens>(body) {
-        return Poll::Done(tokens);
+pub fn pkce_challenge(verifier: &str) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(sha2::Sha256::digest(verifier.as_bytes()))
+}
+
+/// The address the browser is sent to.
+#[must_use]
+pub fn authorize_url(
+    client_id: &str,
+    redirect_uri: &str,
+    state: &str,
+    challenge: &str,
+    login_hint: Option<&str>,
+) -> String {
+    let mut url =
+        reqwest::Url::parse(&format!("{AUTHORITY}/authorize")).expect("the authority URL parses");
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("client_id", client_id)
+            .append_pair("response_type", "code")
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("response_mode", "query")
+            .append_pair("scope", SCOPES)
+            .append_pair("state", state)
+            .append_pair("code_challenge", challenge)
+            .append_pair("code_challenge_method", "S256");
+        if let Some(hint) = login_hint {
+            q.append_pair("login_hint", hint);
+        }
     }
-    match serde_json::from_str::<OauthError>(body) {
-        Ok(e) if e.error == "authorization_pending" => Poll::Pending,
-        Ok(e) if e.error == "slow_down" => Poll::SlowDown,
-        Ok(e) => Poll::Failed(match e.error.as_str() {
-            "authorization_declined" => "the sign-in was declined".to_owned(),
-            "expired_token" => "the code expired before the sign-in finished".to_owned(),
-            _ => e.error_description.unwrap_or(e.error),
-        }),
-        Err(_) => Poll::Failed(format!("unexpected answer from Microsoft: {body}")),
+    url.into()
+}
+
+/// What one request to the local listener carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Callback {
+    /// The authorization code, with a matching `state`.
+    Code(String),
+    /// Microsoft reported a failure, or the redirect was not for this sign-in.
+    Failed(String),
+    /// Not the redirect at all (a favicon request, say): keep listening.
+    Other,
+}
+
+/// Reads the request line of an HTTP request to the listener.
+#[must_use]
+pub fn parse_callback(request: &str, state: &str) -> Callback {
+    let Some(target) = request
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+    else {
+        return Callback::Other;
+    };
+    let Ok(url) = reqwest::Url::parse(&format!("http://localhost{target}")) else {
+        return Callback::Other;
+    };
+    let get = |key: &str| {
+        url.query_pairs()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.into_owned())
+    };
+    if let Some(error) = get("error") {
+        return Callback::Failed(get("error_description").unwrap_or(error));
+    }
+    match (get("code"), get("state")) {
+        (Some(code), Some(s)) if s == state => Callback::Code(code),
+        (Some(_), _) => Callback::Failed(
+            "the redirect did not come from this sign-in (state mismatch)".to_owned(),
+        ),
+        _ => Callback::Other,
     }
 }
 
-/// Runs the device-code flow: prints the code, waits for approval, and stores
-/// the refresh token. Returns the access token of the new session.
+const PAGE_DONE: &str = "<!doctype html><meta charset=utf-8><title>plank-mail-mcp</title><body style=\"font-family:system-ui;margin:3em\"><h1>Signed in</h1><p>You can close this tab and go back to the terminal.</p>";
+const PAGE_FAILED: &str = "<!doctype html><meta charset=utf-8><title>plank-mail-mcp</title><body style=\"font-family:system-ui;margin:3em\"><h1>Sign-in failed</h1><p>The terminal says why.</p>";
+
+/// Answers the browser with `page` and closes the connection.
+async fn respond(stream: &mut tokio::net::TcpStream, page: &str) {
+    let reply = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+        page.len()
+    );
+    let _ = stream.write_all(reply.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
+/// Waits on `listener` for the redirect carrying the code.
+async fn wait_for_code(listener: tokio::net::TcpListener, state: &str) -> Result<String> {
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        let mut buf = vec![0u8; 8192];
+        let n = stream.read(&mut buf).await.unwrap_or(0);
+        let request = String::from_utf8_lossy(&buf[..n]);
+        match parse_callback(&request, state) {
+            Callback::Code(code) => {
+                respond(&mut stream, PAGE_DONE).await;
+                return Ok(code);
+            }
+            Callback::Failed(why) => {
+                respond(&mut stream, PAGE_FAILED).await;
+                bail!(why);
+            }
+            Callback::Other => {
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        }
+    }
+}
+
+/// Signs in in the browser and stores the refresh token. Returns the access
+/// token of the new session.
 ///
 /// # Errors
-/// A network failure, a declined or expired sign-in, or no refresh token.
-pub async fn login(http: &reqwest::Client, client_id: &str, account: &str) -> Result<String> {
-    let code: DeviceAuthorization = http
-        .post(format!("{AUTHORITY}/devicecode"))
-        .form(&[("client_id", client_id), ("scope", SCOPES)])
+/// No browser, a declined or timed-out sign-in, a redirect that does not
+/// match, or a failed code exchange.
+pub async fn login(
+    http: &reqwest::Client,
+    client_id: &str,
+    account: &str,
+    login_hint: Option<&str>,
+) -> Result<String> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("cannot open a local port for the sign-in redirect")?;
+    let redirect_uri = format!("http://localhost:{}", listener.local_addr()?.port());
+    let verifier = random_token(48)?;
+    let state = random_token(24)?;
+    let url = authorize_url(
+        client_id,
+        &redirect_uri,
+        &state,
+        &pkce_challenge(&verifier),
+        login_hint,
+    );
+    let opened = std::process::Command::new("open")
+        .arg(&url)
+        .status()
+        .is_ok_and(|s| s.success());
+    if opened {
+        eprintln!("Your browser is open at the Microsoft sign-in page; finish there.");
+    } else {
+        eprintln!("Open this address in a browser to sign in:\n{url}");
+    }
+    let code = tokio::time::timeout(SIGN_IN_TIMEOUT, wait_for_code(listener, &state))
+        .await
+        .map_err(|_| anyhow!("the sign-in did not finish within five minutes"))??;
+    let resp = http
+        .post(format!("{AUTHORITY}/token"))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", client_id),
+            ("code", code.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("code_verifier", verifier.as_str()),
+            ("scope", SCOPES),
+        ])
         .send()
         .await
-        .context("cannot reach login.microsoftonline.com")?
-        .error_for_status()
-        .context("Microsoft refused the sign-in request (is the client ID right?)")?
-        .json()
-        .await?;
-    eprintln!("{}", code.message);
-    let deadline = Instant::now() + Duration::from_secs(code.expires_in);
-    let mut interval = code.interval.max(1);
-    loop {
-        tokio::time::sleep(Duration::from_secs(interval)).await;
-        if Instant::now() > deadline {
-            bail!("the code expired before the sign-in finished");
-        }
-        let body = http
-            .post(format!("{AUTHORITY}/token"))
-            .form(&[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("client_id", client_id),
-                ("device_code", code.device_code.as_str()),
-            ])
-            .send()
-            .await?
-            .text()
-            .await?;
-        match classify_poll(&body) {
-            Poll::Done(tokens) => {
-                let refresh = tokens
-                    .refresh_token
-                    .ok_or_else(|| anyhow!("Microsoft returned no refresh token"))?;
-                store_refresh_token(account, &refresh)?;
-                return Ok(tokens.access_token);
-            }
-            Poll::Pending => {}
-            Poll::SlowDown => interval += 5,
-            Poll::Failed(why) => bail!(why),
-        }
+        .context("cannot reach login.microsoftonline.com")?;
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("Microsoft refused the sign-in: {body}");
     }
+    let tokens: Tokens = resp.json().await?;
+    let refresh = tokens
+        .refresh_token
+        .ok_or_else(|| anyhow!("Microsoft returned no refresh token"))?;
+    store_refresh_token(account, &refresh)?;
+    Ok(tokens.access_token)
 }
 
 fn entry(account: &str) -> Result<keyring::Entry> {
@@ -260,30 +346,49 @@ mod tests {
     }
 
     #[test]
-    fn the_device_code_answer_parses() {
-        let code: DeviceAuthorization = serde_json::from_str(
-            r#"{"device_code":"dc","user_code":"ABCD-EFGH","verification_uri":"https://microsoft.com/devicelogin","expires_in":900,"interval":5,"message":"To sign in, use a web browser"}"#,
-        )
-        .expect("parses");
-        assert_eq!(code.user_code, "ABCD-EFGH");
-        assert_eq!(code.interval, 5);
+    fn the_pkce_challenge_is_sha256_in_url_safe_base64() {
+        // Expected value computed independently with Python's hashlib.
+        assert_eq!(
+            pkce_challenge("dBjftJeZ4CVP-mJ92IG0osCwGAPJqWxnaWA3XQuzZMs"),
+            "KJEAtFijzef3OWMnazFd42FLCnR6poyQveJl9A95EEk"
+        );
+        assert_eq!(random_token(48).expect("random").len(), 64);
+        assert_ne!(random_token(24).expect("a"), random_token(24).expect("b"));
     }
 
     #[test]
-    fn polling_answers_are_classified() {
+    fn the_authorize_url_carries_pkce_state_and_scopes() {
+        let url = authorize_url("cid", "http://localhost:5555", "st", "ch", Some("me@x.org"));
+        let parsed = reqwest::Url::parse(&url).expect("url");
+        let q: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(q["redirect_uri"], "http://localhost:5555");
+        assert_eq!(q["code_challenge_method"], "S256");
+        assert_eq!(q["state"], "st");
+        assert_eq!(q["login_hint"], "me@x.org");
+        assert!(!q["scope"].to_ascii_lowercase().contains("send"));
+    }
+
+    #[test]
+    fn the_redirect_is_accepted_only_with_the_right_state() {
         assert_eq!(
-            classify_poll(r#"{"error":"authorization_pending"}"#),
-            Poll::Pending
+            parse_callback("GET /?code=abc%2Fd&state=st HTTP/1.1\r\nHost: x\r\n", "st"),
+            Callback::Code("abc/d".to_owned())
         );
-        assert_eq!(classify_poll(r#"{"error":"slow_down"}"#), Poll::SlowDown);
+        assert!(matches!(
+            parse_callback("GET /?code=abc&state=forged HTTP/1.1", "st"),
+            Callback::Failed(_)
+        ));
         assert_eq!(
-            classify_poll(r#"{"error":"expired_token","error_description":"x"}"#),
-            Poll::Failed("the code expired before the sign-in finished".to_owned())
+            parse_callback(
+                "GET /?error=access_denied&error_description=User+declined HTTP/1.1",
+                "st"
+            ),
+            Callback::Failed("User declined".to_owned())
         );
-        let done = classify_poll(
-            r#"{"access_token":"a","expires_in":3600,"refresh_token":"r","token_type":"Bearer"}"#,
+        assert_eq!(
+            parse_callback("GET /favicon.ico HTTP/1.1", "st"),
+            Callback::Other
         );
-        assert!(matches!(done, Poll::Done(ref t) if t.refresh_token.as_deref() == Some("r")));
-        assert!(matches!(classify_poll("<html>"), Poll::Failed(_)));
+        assert_eq!(parse_callback("", "st"), Callback::Other);
     }
 }

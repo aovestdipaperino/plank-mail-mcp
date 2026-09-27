@@ -42,9 +42,12 @@ macOS only for now: the sign-in is kept in the Keychain.
 
     plank-mail-mcp login
 
-It prints a short code and a Microsoft address. Open the address, enter the
-code, and approve. The refresh token is stored in the macOS Keychain under the
-service `plank-mail-mcp`; nothing is written to disk in plain text.
+Your browser opens at Microsoft's sign-in page. Sign in and approve, and
+Microsoft sends the browser back to a one-shot listener this command opens on
+`127.0.0.1`; the tab then says you can close it. The exchange uses PKCE and a
+`state` check, so a redirect meant for another program cannot complete it. The
+refresh token is stored in the macOS Keychain under the service
+`plank-mail-mcp`; nothing is written to disk in plain text.
 
     plank-mail-mcp status    # who is signed in
     plank-mail-mcp logout    # forget the sign-in
@@ -83,8 +86,10 @@ of the built-in one, register it in the Azure portal:
 
 1. Microsoft Entra ID, App registrations, New registration.
 2. Supported account types: accounts in any organizational directory and
-   personal Microsoft accounts. No redirect URI.
-3. Authentication: set "Allow public client flows" to Yes.
+   personal Microsoft accounts.
+3. Redirect URI: platform "Public client/native (mobile & desktop)", value
+   `http://localhost`. Microsoft accepts any port on localhost for this
+   platform, which is what lets `login` pick a free one each time.
 4. API permissions: add Microsoft Graph delegated `Mail.ReadWrite`,
    `User.Read` and `offline_access`. Do not add `Mail.Send`.
 

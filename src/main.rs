@@ -60,7 +60,13 @@ async fn run(args: Vec<String>) -> Result<()> {
     let account = config.keychain_account().to_owned();
     match command.as_str() {
         "login" => {
-            auth::login(&http, config.client_id()?, &account).await?;
+            auth::login(
+                &http,
+                config.client_id()?,
+                &account,
+                config.account.as_deref(),
+            )
+            .await?;
             eprintln!("signed in; HAL can read this mailbox now");
             Ok(())
         }

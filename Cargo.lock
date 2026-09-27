@@ -1431,6 +1431,8 @@ name = "plank-mail-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
+ "getrandom 0.4.3",
  "html2text",
  "keyring",
  "reqwest",
@@ -1438,6 +1440,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "toml",
 ]
