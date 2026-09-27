@@ -1,5 +1,14 @@
 # plank-mail-mcp
 
+> **Status:** HAL, the plank profile this was written for, currently gets its
+> mail from Softeria's
+> [`ms-365-mcp-server`](https://github.com/Softeria/ms-365-mcp-server) limited
+> to mail tools, because this server has no published app registration yet.
+> This one remains the stricter option: it enforces in code that moves go only
+> to `HAL-processed` and that updates touch only the read flag, which Softeria's
+> server leaves to the agent's prompt. It works today with your own app
+> registration in `client_id` (see the last section).
+
 An [MCP](https://modelcontextprotocol.io) server over one Outlook mailbox, built
 for [plank](https://github.com/aovestdipaperino/plank)'s HAL profile. It lets an
 agent read mail and tidy it up, but not send or delete anything.
