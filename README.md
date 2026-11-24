@@ -1,5 +1,7 @@
 # plank-mail-mcp
 
+[![GitHub stars](https://img.shields.io/github/stars/aovestdipaperino/plank-mail-mcp?logo=github&color=brightgreen)](https://github.com/aovestdipaperino/plank-mail-mcp/stargazers)
+
 > **Status:** HAL, the plank profile this was written for, currently gets its
 > mail from Softeria's
 > [`ms-365-mcp-server`](https://github.com/Softeria/ms-365-mcp-server) limited
